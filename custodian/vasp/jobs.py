@@ -11,6 +11,7 @@ import numpy as np
 
 from pymatgen import Structure
 from pymatgen.io.vasp import VaspInput, Incar, Poscar, Outcar, Kpoints, Vasprun
+from pymatgen.util.convergence import determine_convergence
 from monty.os.path import which
 from monty.shutil import decompress_dir
 from monty.serialization import dumpfn, loadfn
@@ -177,7 +178,7 @@ class VaspJob(Job):
                 # Default functionality is to copy CONTCAR to POSCAR and set
                 # ISTART to 1 in the INCAR, but other actions can be specified
                 if self.auto_continue is True:
-                    actions = [{"file": "CONTCAR", 
+                    actions = [{"file": "CONTCAR",
                                 "action": {"_file_copy": {"dest": "POSCAR"}}},
                                {"dict": "INCAR",
                                 "action": {"_set": {"ISTART": 1}}}]
@@ -304,7 +305,7 @@ class VaspJob(Job):
         Returns a list of thres jobs to perform an optimization for any
         metaGGA functional. There is an initial calculation of the
         GGA wavefunction which is fed into the initial metaGGA optimization
-        to precondition the electronic structure optimizer. The metaGGA 
+        to precondition the electronic structure optimizer. The metaGGA
         optimization is performed using the double relaxation scheme
         """
 
@@ -409,6 +410,68 @@ class VaspJob(Job):
             logger.info("Generating job = %d!" % (i+1))
             yield VaspJob(vasp_cmd, final=False, backup=backup,
                           suffix=".relax%d" % (i+1), settings_override=settings,
+                          **vasp_job_kwargs)
+
+    @classmethod
+    def converge_run(cls, vasp_cmd, property_to_vary, property_iterable,
+                     energy_tol=0.001, **vasp_job_kwargs):
+        """
+        Returns a generator of jobs to converge a property to a set tolerance.
+        Will run an infinite series of single point calculations jobs until the
+        change in total energy is less than e_change_tol.
+
+        Args:
+            vasp_cmd (str): Command to run vasp as a list of args. For example,
+                if you are using mpirun, it can be something like
+                ["mpirun", "pvasp.5.2.11"]
+            vol_change_tol (float): The tolerance at which to stop a run.
+                Defaults to 0.05, i.e., 5%.
+            max_steps (int): The maximum number of runs. Defaults to 10 (
+                highly unlikely that this limit is ever reached).
+            ediffg (float): Force convergence criteria for subsequent runs (
+                ignored for the initial run.)
+            half_kpts_first_relax (bool): Whether to halve the kpoint grid
+                for the first relaxation. Speeds up difficult convergence
+                considerably. Defaults to False.
+            \*\*vasp_job_kwargs: Passthrough kwargs to VaspJob. See
+                :class:`custodian.vasp.jobs.VaspJob`.
+
+        Returns:
+            Generator of jobs.
+        """
+        energies = []
+        properties = []
+        settings = None
+        for i, prop in enumerate(property_iterable):
+            if i != 0:
+                vr = Vasprun('vasprun.xml')
+
+                # total energy in eV per atom.
+                energies.append(vr.final_energy / vr.final_structure.num_atoms)
+                e_diff = (energies[-1] - energies[-2]) * 1000
+
+                logger.info("Energy difference = {:.3f} meV per atom".
+                            format(e_diff))
+
+                # negative energy tol makes conv check the x value for which y
+                # is converged within tol of the assymtotic value
+                converged = determine_convergence(properties, energies, '',
+                                                  -energy_tol)
+
+                if i > 3 and converged[0]:
+                    logger.info("Stopping convergence!")
+                    break
+                else:
+                    incar_update = {property_to_vary: prop}
+                    settings = [{"dict": "INCAR",
+                                 "action": {"_set": incar_update}}]
+
+            logger.info("Generating job = %d!" % (i+1))
+            properties.append(prop)
+
+            yield VaspJob(vasp_cmd, final=False, backup=False,
+                          suffix=".converge{}".format(i+1),
+                          settings_override=settings,
                           **vasp_job_kwargs)
 
     @classmethod
@@ -797,9 +860,9 @@ class GenerateVaspInputJob(Job):
         """
         Generates a VASP input based on an existing directory. This is typically
         used to modify the VASP input files before the next VaspJob.
-        
+
         Args:
-            input_set (str): Full path to the input set. E.g., 
+            input_set (str): Full path to the input set. E.g.,
                 "pymatgen.io.vasp.sets.MPNonSCFSet".
             contcar_only (bool): If True (default), only CONTCAR structures
                 are used as input to the input set.
@@ -824,4 +887,5 @@ class GenerateVaspInputJob(Job):
         vis.write_input(".")
 
     def postprocess(self):
+        pass
         pass
